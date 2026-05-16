@@ -1,0 +1,690 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+from io import BytesIO
+
+import pandas as pd
+import streamlit as st
+
+from algorithm import generate_daily_planning
+from database import (
+    execute,
+    get_settings,
+    init_db,
+    load_demo_data,
+    query_df,
+    recompute_agent_scores,
+    sanction_matrix,
+    set_setting,
+)
+
+st.set_page_config(page_title="REGULA-RH Vaccipha × Umed", layout="wide")
+init_db()
+
+MENU = [
+    "Tableau de bord",
+    "Prestataires",
+    "Pharmacies",
+    "Demandes Umed",
+    "Disponibilités du jour",
+    "Générer le planning",
+    "Planning journalier",
+    "Coûts et rapports",
+    "Paramètres",
+    "Incidents",
+    "Traitement des incidents",
+    "Scores & ludification",
+    "Paie conditionnelle",
+    "Classement des prestataires",
+]
+
+
+def money(x) -> str:
+    try:
+        return f"{int(x):,}".replace(",", " ") + " FCFA"
+    except Exception:
+        return "0 FCFA"
+
+
+def df_download_button(df: pd.DataFrame, filename: str, label: str = "Exporter Excel") -> None:
+    if df.empty:
+        return
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="export")
+    st.download_button(
+        label,
+        output.getvalue(),
+        file_name=filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def format_agent(row) -> str:
+    if row is None or pd.isna(row):
+        return ""
+    return str(row)
+
+
+def agent_options(include_empty: bool = True) -> dict[str, int | None]:
+    df = query_df("SELECT id_agent, nom, prenom, categorie_agent FROM agents ORDER BY nom, prenom")
+    opts: dict[str, int | None] = {}
+    if include_empty:
+        opts["— Aucun —"] = None
+    for _, r in df.iterrows():
+        opts[f"#{int(r.id_agent)} - {r.nom} {r.prenom or ''} ({r.categorie_agent})"] = int(r.id_agent)
+    return opts
+
+
+def pharmacy_options(include_empty: bool = True) -> dict[str, int | None]:
+    df = query_df("SELECT id_pharmacie, nom_pharmacie FROM pharmacies ORDER BY nom_pharmacie")
+    opts: dict[str, int | None] = {}
+    if include_empty:
+        opts["— Aucune —"] = None
+    for _, r in df.iterrows():
+        opts[f"#{int(r.id_pharmacie)} - {r.nom_pharmacie}"] = int(r.id_pharmacie)
+    return opts
+
+
+def sidebar() -> str:
+    st.sidebar.title("REGULA-RH")
+    st.sidebar.caption("Vaccipha × Umed — MVP local")
+    menu = st.sidebar.radio("Menu", MENU)
+    st.sidebar.divider()
+    if st.sidebar.button("Charger données de démonstration"):
+        load_demo_data()
+        st.sidebar.success("Données de démonstration chargées si la base était vide.")
+        st.rerun()
+    return menu
+
+
+def dashboard() -> None:
+    st.title("Tableau de bord opérationnel")
+    selected_date = st.date_input("Date", date.today()).isoformat()
+
+    pharmacies = query_df("SELECT * FROM pharmacies WHERE statut='active'")
+    planning = query_df("SELECT * FROM planning WHERE date=?", (selected_date,))
+    demandes = query_df("SELECT * FROM demandes_umed WHERE date_demande<=?", (selected_date,))
+    cout = query_df("SELECT * FROM couts_journaliers WHERE date=?", (selected_date,))
+    alertes = query_df("SELECT * FROM alertes WHERE date=? ORDER BY id_alerte DESC", (selected_date,))
+    incidents_month = query_df("SELECT * FROM incidents WHERE substr(date_signalement,1,7)=?", (selected_date[:7],))
+
+    covered_ph = int((planning["affectation_type"] == "pharmacie").sum()) if not planning.empty else 0
+    missions_affected = int((planning["affectation_type"] == "mission Umed").sum()) if not planning.empty else 0
+    total_cost = int(cout.iloc[0]["cout_total"]) if not cout.empty else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pharmacies actives", len(pharmacies))
+    c2.metric("Pharmacies couvertes", covered_ph, f"{(covered_ph/len(pharmacies)*100 if len(pharmacies) else 0):.0f}%")
+    c3.metric("Demandes Umed", len(demandes))
+    c4.metric("Missions Umed affectées", missions_affected)
+
+    c5, c6, c7, c8 = st.columns(4)
+    n_as = int(cout.iloc[0]["nombre_as_mobilises"]) if not cout.empty else 0
+    n_ide = int(cout.iloc[0]["nombre_ide_mobilises"]) if not cout.empty else 0
+    c5.metric("AS mobilisés", n_as)
+    c6.metric("IDE mobilisés", n_ide)
+    c7.metric("Agents mobilisés", len(planning["agent_id"].unique()) if not planning.empty else 0)
+    c8.metric("Coût RH journalier", money(total_cost))
+
+    st.subheader("Alertes critiques")
+    if alertes.empty:
+        st.success("Aucune alerte pour cette date.")
+    else:
+        st.dataframe(alertes[["niveau", "type_alerte", "message", "statut", "created_at"]], use_container_width=True)
+
+    st.subheader("Incidents du mois")
+    i1, i2, i3, i4 = st.columns(4)
+    i1.metric("Signalés", len(incidents_month))
+    i2.metric("En instruction", len(incidents_month[incidents_month["statut_traitement"].isin(["signalé", "en cours d’instruction", "demande d’explication envoyée"])])) if not incidents_month.empty else i2.metric("En instruction", 0)
+    i3.metric("Confirmés", len(incidents_month[incidents_month["statut_traitement"].isin(["confirmé", "sanction appliquée", "clôturé"])])) if not incidents_month.empty else i3.metric("Confirmés", 0)
+    i4.metric("Agents suspendus", len(query_df("SELECT * FROM agents WHERE statut='suspendu'")))
+
+    st.subheader("Planning du jour")
+    if planning.empty:
+        st.info("Aucun planning généré pour cette date.")
+    else:
+        merged = planning.merge(query_df("SELECT id_agent, nom, prenom FROM agents"), left_on="agent_id", right_on="id_agent", how="left")
+        st.dataframe(merged[["nom", "prenom", "categorie_agent", "affectation_type", "affectation_label", "cluster", "priorite_mission", "cout_journalier", "statut"]], use_container_width=True)
+
+
+def prestataires() -> None:
+    st.title("Prestataires")
+    settings = get_settings()
+    with st.expander("Ajouter un prestataire", expanded=False):
+        with st.form("add_agent"):
+            c1, c2, c3 = st.columns(3)
+            nom = c1.text_input("Nom")
+            prenom = c2.text_input("Prénom")
+            telephone = c3.text_input("Téléphone")
+            c4, c5, c6 = st.columns(3)
+            categorie = c4.selectbox("Catégorie", ["AS", "IDE", "médecin", "sage-femme", "autre"])
+            profession = c5.text_input("Profession", value="aide-soignant" if categorie == "AS" else "infirmier IDE")
+            cluster = c6.text_input("Cluster principal", value="Cocody")
+            commune = st.text_input("Commune de résidence")
+            competences = st.text_area("Compétences", value="vaccination, surveillance simple" if categorie == "AS" else "vaccination, soins infirmiers, injection, prélèvement, perfusion, pansements")
+            actes = st.text_area("Actes autorisés", value="surveillance simple" if categorie == "AS" else "injection, prélèvement sanguin, pose de perfusion, pansements")
+            c7, c8, c9 = st.columns(3)
+            habil_vaccipha = c7.selectbox("Habilitation Vaccipha", ["oui", "non"])
+            habil_dom = c8.selectbox("Habilitation soins domicile", ["oui", "non"], index=0 if categorie == "IDE" else 0)
+            habil_ide = c9.selectbox("Habilitation actes infirmiers", ["oui", "non"], index=0 if categorie == "IDE" else 1)
+            c10, c11, c12 = st.columns(3)
+            taux = int(settings.get("taux_journalier_IDE" if categorie == "IDE" else "taux_journalier_AS", "10000" if categorie == "IDE" else "5000"))
+            transport = int(settings.get("prime_transport_IDE" if categorie == "IDE" else "prime_transport_AS", "1000"))
+            taux = c10.number_input("Taux journalier", value=taux, step=500)
+            transport = c11.number_input("Prime transport", value=transport, step=500)
+            score = c12.number_input("Score fiabilité", value=80, min_value=0, max_value=100)
+            numero = st.text_input("Numéro ordre / autorisation", value="")
+            observations = st.text_area("Observations")
+            submitted = st.form_submit_button("Enregistrer")
+            if submitted:
+                execute(
+                    """
+                    INSERT INTO agents(nom, prenom, telephone, profession, categorie_agent, competences, actes_autorises,
+                                       cluster_principal, commune_residence, statut, score_fiabilite, taux_journalier,
+                                       prime_transport, cout_journalier_total, habilitation_vaccipha, habilitation_soins_domicile,
+                                       habilitation_actes_infirmiers, numero_ordre_ou_autorisation, observations)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'actif', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (nom, prenom, telephone, profession, categorie, competences, actes, cluster, commune, int(score), int(taux), int(transport), int(taux + transport), habil_vaccipha, habil_dom, habil_ide, numero, observations),
+                )
+                st.success("Prestataire ajouté.")
+                st.rerun()
+
+    df = query_df("SELECT * FROM agents ORDER BY categorie_agent, nom")
+    st.subheader("Liste des prestataires")
+    if df.empty:
+        st.info("Aucun prestataire enregistré.")
+    else:
+        filters = st.columns(3)
+        cat_filter = filters[0].multiselect("Filtrer catégorie", sorted(df["categorie_agent"].dropna().unique()))
+        stat_filter = filters[1].multiselect("Filtrer statut", sorted(df["statut"].dropna().unique()))
+        cluster_filter = filters[2].multiselect("Filtrer cluster", sorted(df["cluster_principal"].dropna().unique()))
+        view = df.copy()
+        if cat_filter:
+            view = view[view["categorie_agent"].isin(cat_filter)]
+        if stat_filter:
+            view = view[view["statut"].isin(stat_filter)]
+        if cluster_filter:
+            view = view[view["cluster_principal"].isin(cluster_filter)]
+        st.dataframe(view[["id_agent", "nom", "prenom", "categorie_agent", "profession", "cluster_principal", "statut", "score_fiabilite", "cout_journalier_total", "habilitation_vaccipha", "habilitation_soins_domicile", "habilitation_actes_infirmiers"]], use_container_width=True)
+        df_download_button(view, "prestataires_regula_rh.xlsx")
+
+        with st.expander("Changer le statut d’un prestataire"):
+            opts = agent_options(include_empty=False)
+            label = st.selectbox("Prestataire", list(opts.keys()))
+            new_status = st.selectbox("Nouveau statut", ["actif", "indisponible", "suspendu", "à recycler"])
+            if st.button("Mettre à jour le statut"):
+                execute("UPDATE agents SET statut=?, updated_at=CURRENT_TIMESTAMP WHERE id_agent=?", (new_status, opts[label]))
+                st.success("Statut mis à jour.")
+                st.rerun()
+
+
+def pharmacies() -> None:
+    st.title("Pharmacies")
+    opts_agents = agent_options()
+    with st.expander("Ajouter une pharmacie", expanded=False):
+        with st.form("add_pharmacy"):
+            c1, c2, c3 = st.columns(3)
+            nom = c1.text_input("Nom pharmacie")
+            commune = c2.text_input("Commune")
+            quartier = c3.text_input("Quartier")
+            c4, c5, c6 = st.columns(3)
+            cluster = c4.text_input("Cluster")
+            niveau = c5.selectbox("Niveau activité", ["faible", "moyen", "fort"])
+            couverture = c6.number_input("Couverture minimale", value=1, min_value=1)
+            titulaire_label = st.selectbox("Agent titulaire", list(opts_agents.keys()))
+            backups = st.multiselect("Backups autorisés", list(opts_agents.keys()))
+            observations = st.text_area("Observations")
+            if st.form_submit_button("Enregistrer"):
+                backup_ids = [str(opts_agents[b]) for b in backups if opts_agents[b] is not None]
+                execute(
+                    """
+                    INSERT INTO pharmacies(nom_pharmacie, commune, quartier, cluster, niveau_activite, couverture_minimale,
+                                           agent_titulaire, backups_autorises, statut, observations)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                    """,
+                    (nom, commune, quartier, cluster, niveau, int(couverture), opts_agents[titulaire_label], ",".join(backup_ids), observations),
+                )
+                st.success("Pharmacie ajoutée.")
+                st.rerun()
+    df = query_df("SELECT * FROM pharmacies ORDER BY cluster, nom_pharmacie")
+    st.subheader("Liste des pharmacies")
+    st.dataframe(df, use_container_width=True)
+    df_download_button(df, "pharmacies_regula_rh.xlsx")
+
+
+def demandes_umed() -> None:
+    st.title("Demandes Umed")
+    with st.expander("Ajouter une demande Umed", expanded=True):
+        with st.form("add_demande"):
+            c1, c2, c3 = st.columns(3)
+            d = c1.date_input("Date demande", date.today()).isoformat()
+            type_mission = c2.selectbox("Type mission", ["Surveillance simple", "Garde à domicile non technique", "Surveillance longue durée", "Injection", "Prélèvement sanguin", "Pose de perfusion", "Pansement simple", "Pansement complexe", "Vaccination en pharmacie", "Vaccination à domicile", "Autre"])
+            priorite = c3.selectbox("Priorité", ["P1", "P2", "P3", "P4"])
+            c4, c5, c6 = st.columns(3)
+            commune = c4.text_input("Commune")
+            quartier = c5.text_input("Quartier")
+            cluster = c6.text_input("Cluster")
+            c7, c8, c9 = st.columns(3)
+            duree = c7.selectbox("Durée estimée", ["demi-journée", "journée", "garde 12h", "garde 24h"])
+            categorie_requise = c8.selectbox("Catégorie requise", ["AS", "IDE", "indifférent", "supervision médicale"])
+            technicite = c9.selectbox("Niveau technicité", ["faible", "moyen", "élevé"])
+            acte = st.text_input("Acte requis", value=type_mission.lower())
+            c10, c11, c12, c13 = st.columns(4)
+            acte_inf = c10.selectbox("Acte infirmier", ["oui", "non"], index=0 if type_mission in ["Injection", "Prélèvement sanguin", "Pose de perfusion", "Pansement complexe", "Vaccination à domicile"] else 1)
+            presc_req = c11.selectbox("Prescription requise", ["oui", "non"], index=0 if acte_inf == "oui" else 1)
+            presc_ok = c12.selectbox("Prescription disponible", ["oui", "non"])
+            med_ok = c13.selectbox("Validation médecin obtenue", ["oui", "non"])
+            comp = st.text_input("Compétence requise", value=acte)
+            heure_limite = st.text_input("Heure limite", value="")
+            observations = st.text_area("Observations")
+            if st.form_submit_button("Enregistrer"):
+                execute(
+                    """
+                    INSERT INTO demandes_umed(date_demande, type_mission, priorite, commune, quartier, cluster, duree_estimee,
+                                              competence_requise, categorie_agent_requise, acte_requis, niveau_technicite,
+                                              acte_infirmier, prescription_medicale_requise, prescription_medicale_disponible,
+                                              validation_medecin_requise, validation_medecin_obtenue, heure_limite_prise_en_charge, observations)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (d, type_mission, priorite, commune, quartier, cluster, duree, comp, categorie_requise, acte, technicite, acte_inf, presc_req, presc_ok, "oui" if med_ok == "non" else "non", med_ok, heure_limite, observations),
+                )
+                st.success("Demande ajoutée.")
+                st.rerun()
+    df = query_df("SELECT * FROM demandes_umed ORDER BY date_demande DESC, priorite, id_demande DESC")
+    st.subheader("Liste des demandes")
+    st.dataframe(df, use_container_width=True)
+    df_download_button(df, "demandes_umed_regula_rh.xlsx")
+
+
+def disponibilites() -> None:
+    st.title("Disponibilités du jour")
+    selected_date = st.date_input("Date", date.today()).isoformat()
+    agents = query_df("SELECT id_agent, nom, prenom, categorie_agent, cluster_principal FROM agents WHERE statut='actif' ORDER BY nom")
+    disp = query_df("SELECT * FROM disponibilites WHERE date=?", (selected_date,))
+    merged = agents.merge(disp, left_on="id_agent", right_on="agent_id", how="left")
+    merged["statut_disponibilite"] = merged["statut_disponibilite"].fillna("disponible")
+    st.dataframe(merged[["id_agent", "nom", "prenom", "categorie_agent", "cluster_principal", "statut_disponibilite"]], use_container_width=True)
+
+    with st.form("set_dispo"):
+        opts = agent_options(include_empty=False)
+        agent_label = st.selectbox("Agent", list(opts.keys()))
+        statut = st.selectbox("Statut disponibilité", ["disponible", "affecté", "repos", "indisponible", "astreinte", "réserve chaude", "réserve tiède", "réserve froide"])
+        commentaire = st.text_input("Commentaire")
+        if st.form_submit_button("Enregistrer disponibilité"):
+            execute(
+                """
+                INSERT INTO disponibilites(date, agent_id, statut_disponibilite, commentaire)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date, agent_id) DO UPDATE SET statut_disponibilite=excluded.statut_disponibilite, commentaire=excluded.commentaire
+                """,
+                (selected_date, opts[agent_label], statut, commentaire),
+            )
+            st.success("Disponibilité enregistrée.")
+            st.rerun()
+
+
+def generer_planning_page() -> None:
+    st.title("Générer le planning")
+    selected_date = st.date_input("Date à planifier", date.today()).isoformat()
+    st.warning("La génération remplace le planning existant de la date sélectionnée.")
+    if st.button("Générer / régénérer le planning", type="primary"):
+        result = generate_daily_planning(selected_date)
+        st.success(f"Planning généré : {result}")
+    planning = query_df("SELECT * FROM planning WHERE date=?", (selected_date,))
+    if not planning.empty:
+        st.dataframe(planning, use_container_width=True)
+
+
+def planning_journalier() -> None:
+    st.title("Planning journalier")
+    selected_date = st.date_input("Date", date.today()).isoformat()
+    df = query_df(
+        """
+        SELECT p.*, a.nom, a.prenom FROM planning p
+        LEFT JOIN agents a ON a.id_agent=p.agent_id
+        WHERE p.date=? ORDER BY p.affectation_type, p.cluster
+        """,
+        (selected_date,),
+    )
+    if df.empty:
+        st.info("Aucun planning pour cette date.")
+        return
+    st.dataframe(df[["id_planning", "nom", "prenom", "categorie_agent", "affectation_type", "affectation_label", "cluster", "priorite_mission", "cout_journalier", "statut", "score_affectation", "observations"]], use_container_width=True)
+    df_download_button(df, f"planning_{selected_date}.xlsx")
+    with st.expander("Modifier le statut d’une affectation"):
+        id_plan = st.number_input("ID planning", min_value=1, step=1)
+        new_status = st.selectbox("Nouveau statut", ["planifié", "réalisé", "annulé", "absent"])
+        obs = st.text_input("Observation")
+        if st.button("Mettre à jour l’affectation"):
+            execute("UPDATE planning SET statut=?, observations=?, updated_at=CURRENT_TIMESTAMP WHERE id_planning=?", (new_status, obs, int(id_plan)))
+            st.success("Affectation mise à jour.")
+            st.rerun()
+
+
+def couts_rapports() -> None:
+    st.title("Coûts et rapports")
+    c1, c2 = st.columns(2)
+    start = c1.date_input("Date début", date.today().replace(day=1)).isoformat()
+    end = c2.date_input("Date fin", date.today()).isoformat()
+    costs = query_df("SELECT * FROM couts_journaliers WHERE date BETWEEN ? AND ? ORDER BY date", (start, end))
+    planning = query_df("SELECT * FROM planning WHERE date BETWEEN ? AND ?", (start, end))
+    if costs.empty:
+        st.info("Aucun coût calculé pour la période.")
+    else:
+        c3, c4, c5 = st.columns(3)
+        c3.metric("Coût total période", money(costs["cout_total"].sum()))
+        c4.metric("AS mobilisés cumulés", int(costs["nombre_as_mobilises"].sum()))
+        c5.metric("IDE mobilisés cumulés", int(costs["nombre_ide_mobilises"].sum()))
+        st.dataframe(costs, use_container_width=True)
+        df_download_button(costs, "couts_regula_rh.xlsx")
+    if not planning.empty:
+        by_agent = planning.groupby(["agent_id", "categorie_agent"], as_index=False)["cout_journalier"].sum().rename(columns={"cout_journalier": "cout_total_agent"})
+        st.subheader("Coût par agent")
+        st.dataframe(by_agent, use_container_width=True)
+        by_type = planning.groupby(["affectation_type", "categorie_agent"], as_index=False)["cout_journalier"].sum()
+        st.subheader("Coût par type d’affectation")
+        st.dataframe(by_type, use_container_width=True)
+
+
+def parametres() -> None:
+    st.title("Paramètres")
+    settings = get_settings()
+    with st.form("settings"):
+        c1, c2, c3, c4 = st.columns(4)
+        taux_as = c1.number_input("Taux journalier AS", value=int(settings.get("taux_journalier_AS", "5000")), step=500)
+        taux_ide = c2.number_input("Taux journalier IDE", value=int(settings.get("taux_journalier_IDE", "10000")), step=500)
+        trans_as = c3.number_input("Transport AS", value=int(settings.get("prime_transport_AS", "1000")), step=500)
+        trans_ide = c4.number_input("Transport IDE", value=int(settings.get("prime_transport_IDE", "1000")), step=500)
+        c5, c6, c7 = st.columns(3)
+        reserve_ide = c5.number_input("Réserve minimale IDE / cluster", value=int(settings.get("reserve_minimale_IDE_par_cluster", "1")), min_value=0)
+        seuil = c6.number_input("Seuil score faible", value=int(settings.get("seuil_score_faible", "50")), min_value=0, max_value=100)
+        prioriser_as = c7.selectbox("Prioriser AS pour pharmacie", ["oui", "non"], index=0 if settings.get("prioriser_AS_pour_pharmacie", "oui") == "oui" else 1)
+        c8, c9, c10 = st.columns(3)
+        autoriser_ide_pharma = c8.selectbox("Autoriser IDE en pharmacie", ["oui", "non"], index=0 if settings.get("autoriser_IDE_sur_poste_pharmacie", "oui") == "oui" else 1)
+        block_presc = c9.selectbox("Bloquer si prescription absente", ["oui", "non"], index=0 if settings.get("bloquer_acte_IDE_si_prescription_absente", "oui") == "oui" else 1)
+        block_med = c10.selectbox("Bloquer si validation médecin absente", ["oui", "non"], index=0 if settings.get("bloquer_acte_IDE_si_validation_medecin_absente", "oui") == "oui" else 1)
+        if st.form_submit_button("Enregistrer paramètres"):
+            for k, v in {
+                "taux_journalier_AS": taux_as,
+                "taux_journalier_IDE": taux_ide,
+                "prime_transport_AS": trans_as,
+                "prime_transport_IDE": trans_ide,
+                "reserve_minimale_IDE_par_cluster": reserve_ide,
+                "seuil_score_faible": seuil,
+                "prioriser_AS_pour_pharmacie": prioriser_as,
+                "autoriser_IDE_sur_poste_pharmacie": autoriser_ide_pharma,
+                "bloquer_acte_IDE_si_prescription_absente": block_presc,
+                "bloquer_acte_IDE_si_validation_medecin_absente": block_med,
+            }.items():
+                set_setting(k, str(v))
+            st.success("Paramètres mis à jour.")
+            st.rerun()
+    st.subheader("Tous les paramètres")
+    st.dataframe(query_df("SELECT * FROM parametres"), use_container_width=True)
+
+
+def incidents_page() -> None:
+    st.title("Signalement d’incident")
+    types_admin = [
+        "Retard de moins ou égal à 1h", "Retard de plus de 1h", "Retard récurrent", "Annulation", "Annulation récurrente",
+        "Absence non justifiée", "Absence non justifiée récurrente", "Vice de procédure", "Discourtoisie envers les collaborateurs",
+        "Discourtoisie récurrente", "Non-préparation des sacs d’intervention", "Non-préparation récurrente des sacs d’intervention",
+        "Mauvaise utilisation ou gestion du stock", "Mauvaise utilisation ou gestion récurrente du stock", "Mauvaise gestion des déchets",
+        "Mauvaise gestion récurrente des déchets", "Encaissements non déclarés",
+    ]
+    types_med = ["Plainte mineure d’un patient", "Erreur clinique ou erreur mineure répétée", "Erreur clinique grave", "Plainte majeure d’un patient", "Administration d’un protocole de soins sans accord préalable du médecin traitant"]
+    opts = agent_options()
+    with st.form("incident_form"):
+        c1, c2, c3 = st.columns(3)
+        d = c1.date_input("Date signalement", date.today()).isoformat()
+        anonyme = c2.selectbox("Signalement anonyme", ["oui", "non"])
+        declarant = c3.text_input("Déclarant, optionnel")
+        agent_label = st.selectbox("Agent concerné", list(opts.keys()))
+        collective = st.selectbox("Responsabilité collective d’équipe", ["non", "oui"])
+        equipe = st.text_input("Équipe concernée, optionnel")
+        categorie = st.selectbox("Catégorie", ["administratif", "médical"])
+        type_incident = st.selectbox("Type d’incident", types_admin if categorie == "administratif" else types_med)
+        matrix = sanction_matrix(type_incident)
+        c4, c5, c6 = st.columns(3)
+        gravite = c4.selectbox("Gravité", ["faible", "modéré", "élevé", "très élevé"], index=["faible", "modéré", "élevé", "très élevé"].index(matrix["gravite"]) if matrix["gravite"] in ["faible", "modéré", "élevé", "très élevé"] else 1)
+        c5.metric("Pénalité proposée", f"{matrix['penalite_points']} pts")
+        c6.write("Sanction proposée")
+        c6.caption(matrix["sanction"])
+        description = st.text_area("Récit détaillé et objectif des faits")
+        preuves = st.text_input("Preuves / pièces justificatives, optionnel")
+        montant_remb = st.number_input("Montant remboursement éventuel", value=0, min_value=0, step=1000)
+        montant_pen = st.number_input("Montant pénalité financière éventuelle", value=0, min_value=0, step=1000)
+        if st.form_submit_button("Signaler l’incident"):
+            execute(
+                """
+                INSERT INTO incidents(date_signalement, anonyme, declarant, agent_id, equipe_id, categorie, type_incident,
+                                      gravite, description, preuves, statut_traitement, sanction, penalite_points,
+                                      impact_paie, montant_remboursement, montant_penalite, responsabilite_collective)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'signalé', ?, ?, ?, ?, ?, ?)
+                """,
+                (d, anonyme, declarant, opts[agent_label], equipe, categorie, type_incident, gravite, description, preuves, matrix["sanction"], int(matrix["penalite_points"]), matrix["impact_paie"], int(montant_remb), int(montant_pen), collective),
+            )
+            st.success("Incident signalé. La sanction ne sera définitive qu’après validation par la Direction.")
+            st.rerun()
+    df = query_df("SELECT * FROM incidents ORDER BY id_incident DESC")
+    st.subheader("Incidents signalés")
+    st.dataframe(df, use_container_width=True)
+
+
+def traitement_incidents() -> None:
+    st.title("Traitement des incidents")
+    incidents = query_df("SELECT * FROM incidents ORDER BY id_incident DESC")
+    if incidents.empty:
+        st.info("Aucun incident enregistré.")
+        return
+    st.dataframe(incidents[["id_incident", "date_signalement", "agent_id", "categorie", "type_incident", "gravite", "statut_traitement", "penalite_points", "sanction", "impact_paie"]], use_container_width=True)
+    ids = incidents["id_incident"].tolist()
+    selected = st.selectbox("Incident à traiter", ids)
+    row = incidents[incidents["id_incident"] == selected].iloc[0]
+    with st.form("process_incident"):
+        status = st.selectbox("Nouveau statut", ["signalé", "en cours d’instruction", "demande d’explication envoyée", "réponse reçue", "confirmé", "rejeté", "sanction appliquée", "clôturé"], index=0)
+        decision = st.text_area("Décision Direction", value=str(row.get("decision_direction") or ""))
+        sanction = st.text_area("Sanction appliquée", value=str(row.get("sanction") or ""))
+        auteur = st.text_input("Auteur de l’action", value="Direction")
+        commentaire = st.text_area("Commentaire")
+        apply_status_agent = st.checkbox("Si sanction élevée/très élevée, mettre l’agent en statut suspendu / à recycler selon le cas", value=False)
+        if st.form_submit_button("Enregistrer traitement"):
+            before = row["statut_traitement"]
+            execute(
+                "UPDATE incidents SET statut_traitement=?, decision_direction=?, sanction=?, date_cloture=?, updated_at=CURRENT_TIMESTAMP WHERE id_incident=?",
+                (status, decision, sanction, date.today().isoformat() if status in ["clôturé", "sanction appliquée", "rejeté"] else None, int(selected)),
+            )
+            execute(
+                "INSERT INTO incident_actions(id_incident, type_action, auteur, commentaire, statut_avant, statut_apres) VALUES (?, ?, ?, ?, ?, ?)",
+                (int(selected), "traitement", auteur, commentaire, before, status),
+            )
+            if status in ["confirmé", "sanction appliquée", "clôturé"] and int(row.get("agent_id") or 0) > 0:
+                # Avoid duplicated malus transaction for same incident.
+                existing = query_df("SELECT * FROM point_transactions WHERE id_incident=? AND type_transaction='malus'", (int(selected),))
+                if existing.empty:
+                    execute(
+                        "INSERT INTO point_transactions(agent_id, date, source, description, points, type_transaction, id_incident) VALUES (?, ?, ?, ?, ?, 'malus', ?)",
+                        (int(row.agent_id), date.today().isoformat(), "incident confirmé", str(row.type_incident), int(row.penalite_points), int(selected)),
+                    )
+                if apply_status_agent:
+                    new_agent_status = "à recycler" if "formation" in str(row.sanction).lower() or "recyclage" in str(row.sanction).lower() else "suspendu"
+                    execute("UPDATE agents SET statut=? WHERE id_agent=?", (new_agent_status, int(row.agent_id)))
+            st.success("Traitement enregistré.")
+            st.rerun()
+    st.subheader("Historique des actions")
+    st.dataframe(query_df("SELECT * FROM incident_actions WHERE id_incident=? ORDER BY id_action DESC", (int(selected),)), use_container_width=True)
+
+
+def scores_ludification() -> None:
+    st.title("Scores & ludification")
+    c1, c2 = st.columns(2)
+    month = c1.number_input("Mois", min_value=1, max_value=12, value=date.today().month)
+    year = c2.number_input("Année", min_value=2024, value=date.today().year)
+    if st.button("Recalculer les scores du mois"):
+        recompute_agent_scores(int(month), int(year))
+        st.success("Scores recalculés.")
+    scores = query_df(
+        """
+        SELECT s.*, a.nom, a.prenom, a.categorie_agent FROM agent_scores s
+        JOIN agents a ON a.id_agent=s.agent_id
+        WHERE s.mois=? AND s.annee=? ORDER BY s.score_final DESC
+        """,
+        (int(month), int(year)),
+    )
+    if scores.empty:
+        st.info("Aucun score calculé pour cette période.")
+    else:
+        st.dataframe(scores, use_container_width=True)
+    st.subheader("Transactions de points")
+    st.dataframe(query_df("SELECT * FROM point_transactions ORDER BY id_transaction DESC LIMIT 200"), use_container_width=True)
+    st.subheader("Badges disponibles")
+    st.dataframe(query_df("SELECT * FROM badges"), use_container_width=True)
+
+
+def paie_conditionnelle() -> None:
+    st.title("Paie conditionnelle")
+    c1, c2 = st.columns(2)
+    month = c1.number_input("Mois paie", min_value=1, max_value=12, value=date.today().month)
+    year = c2.number_input("Année paie", min_value=2024, value=date.today().year)
+    period = f"{int(year):04d}-{int(month):02d}"
+    if st.button("Calculer / recalculer la paie", type="primary"):
+        recompute_agent_scores(int(month), int(year))
+        agents = query_df("SELECT * FROM agents")
+        for _, a in agents.iterrows():
+            plan = query_df("SELECT * FROM planning WHERE agent_id=? AND substr(date,1,7)=?", (int(a.id_agent), period))
+            jours_planifies = len(plan)
+            jours_realises = len(plan[plan["statut"].isin(["planifié", "réalisé"])]) if not plan.empty else 0
+            jours_suspendus = len(plan[plan["statut"] == "absent"]) if not plan.empty else 0
+            jours_valides = len(plan[plan["statut"].isin(["planifié", "réalisé"])]) if not plan.empty else 0
+            total_taux = jours_valides * int(a.taux_journalier or 0)
+            total_transport = jours_valides * int(a.prime_transport or 0)
+            paie_base = total_taux + total_transport
+            score = query_df("SELECT * FROM agent_scores WHERE agent_id=? AND mois=? AND annee=?", (int(a.id_agent), int(month), int(year)))
+            bonus_percent = float(score.iloc[0]["bonus_percent"]) if not score.empty else 0.0
+            # Bonus eligibility: remove bonus if elevated/high incident confirmed this month.
+            confirmed_bad = query_df(
+                """
+                SELECT * FROM incidents WHERE agent_id=? AND substr(date_signalement,1,7)=?
+                  AND statut_traitement IN ('confirmé','sanction appliquée','clôturé')
+                  AND gravite IN ('élevé','très élevé')
+                """,
+                (int(a.id_agent), period),
+            )
+            if not confirmed_bad.empty:
+                bonus_percent = 0.0
+            bonus_perf = int(paie_base * bonus_percent)
+            fin = query_df(
+                """
+                SELECT COALESCE(SUM(montant_remboursement),0) AS remb,
+                       COALESCE(SUM(montant_penalite),0) AS pen
+                FROM incidents WHERE agent_id=? AND substr(date_signalement,1,7)=?
+                  AND statut_traitement IN ('confirmé','sanction appliquée','clôturé')
+                """,
+                (int(a.id_agent), period),
+            )
+            remboursements = int(fin.iloc[0]["remb"]) if not fin.empty else 0
+            penalites = int(fin.iloc[0]["pen"]) if not fin.empty else 0
+            paie_nette = paie_base + bonus_perf - remboursements - penalites
+            execute(
+                """
+                INSERT INTO payroll(agent_id, mois, annee, jours_planifies, jours_realises, jours_valides, jours_suspendus,
+                                    total_taux_journalier, total_transport, paie_base, bonus_performance,
+                                    primes_specifiques, remboursements, penalites_financieres, paie_nette)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                ON CONFLICT(agent_id, mois, annee) DO UPDATE SET
+                    jours_planifies=excluded.jours_planifies,
+                    jours_realises=excluded.jours_realises,
+                    jours_valides=excluded.jours_valides,
+                    jours_suspendus=excluded.jours_suspendus,
+                    total_taux_journalier=excluded.total_taux_journalier,
+                    total_transport=excluded.total_transport,
+                    paie_base=excluded.paie_base,
+                    bonus_performance=excluded.bonus_performance,
+                    remboursements=excluded.remboursements,
+                    penalites_financieres=excluded.penalites_financieres,
+                    paie_nette=excluded.paie_nette
+                """,
+                (int(a.id_agent), int(month), int(year), jours_planifies, jours_realises, jours_valides, jours_suspendus, total_taux, total_transport, paie_base, bonus_perf, remboursements, penalites, paie_nette),
+            )
+        st.success("Paie recalculée.")
+    payroll = query_df(
+        """
+        SELECT p.*, a.nom, a.prenom, a.categorie_agent FROM payroll p
+        JOIN agents a ON a.id_agent=p.agent_id
+        WHERE p.mois=? AND p.annee=? ORDER BY p.paie_nette DESC
+        """,
+        (int(month), int(year)),
+    )
+    if payroll.empty:
+        st.info("Aucune paie calculée pour cette période.")
+    else:
+        c3, c4, c5 = st.columns(3)
+        c3.metric("Paie nette totale", money(payroll["paie_nette"].sum()))
+        c4.metric("Bonus performance", money(payroll["bonus_performance"].sum()))
+        c5.metric("Remboursements/Pénalités", money(payroll["remboursements"].sum() + payroll["penalites_financieres"].sum()))
+        st.dataframe(payroll, use_container_width=True)
+        df_download_button(payroll, f"paie_{period}.xlsx")
+
+
+def classement() -> None:
+    st.title("Classement des prestataires")
+    month = st.number_input("Mois", min_value=1, max_value=12, value=date.today().month)
+    year = st.number_input("Année", min_value=2024, value=date.today().year)
+    scores = query_df(
+        """
+        SELECT s.*, a.nom, a.prenom, a.categorie_agent, a.profession FROM agent_scores s
+        JOIN agents a ON a.id_agent=s.agent_id
+        WHERE s.mois=? AND s.annee=? ORDER BY s.score_final DESC
+        """,
+        (int(month), int(year)),
+    )
+    if scores.empty:
+        st.info("Recalculez les scores pour afficher le classement.")
+        return
+    st.subheader("Top 10 agents par score")
+    st.dataframe(scores.head(10), use_container_width=True)
+    c1, c2 = st.columns(2)
+    c1.subheader("Agents Platine / Or")
+    c1.dataframe(scores[scores["niveau"].isin(["Platine", "Or"])], use_container_width=True)
+    c2.subheader("Agents sous surveillance")
+    c2.dataframe(scores[scores["niveau"].isin(["Rouge", "Bronze"])], use_container_width=True)
+    st.subheader("Agents suspendus / à former")
+    st.dataframe(query_df("SELECT id_agent, nom, prenom, categorie_agent, statut, score_fiabilite FROM agents WHERE statut IN ('suspendu','à recycler')"), use_container_width=True)
+
+
+def main() -> None:
+    menu = sidebar()
+    if menu == "Tableau de bord":
+        dashboard()
+    elif menu == "Prestataires":
+        prestataires()
+    elif menu == "Pharmacies":
+        pharmacies()
+    elif menu == "Demandes Umed":
+        demandes_umed()
+    elif menu == "Disponibilités du jour":
+        disponibilites()
+    elif menu == "Générer le planning":
+        generer_planning_page()
+    elif menu == "Planning journalier":
+        planning_journalier()
+    elif menu == "Coûts et rapports":
+        couts_rapports()
+    elif menu == "Paramètres":
+        parametres()
+    elif menu == "Incidents":
+        incidents_page()
+    elif menu == "Traitement des incidents":
+        traitement_incidents()
+    elif menu == "Scores & ludification":
+        scores_ludification()
+    elif menu == "Paie conditionnelle":
+        paie_conditionnelle()
+    elif menu == "Classement des prestataires":
+        classement()
+
+
+if __name__ == "__main__":
+    main()
